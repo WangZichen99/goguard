@@ -65,7 +65,7 @@ func sendMessage(messageData interface{}) error {
 // 3. AI模型处理核心逻辑 (已使用 AdvancedSession 修复)
 // -----------------------------------------------------------------------------
 
-// --- 修复 1: 使用 AdvancedSession 来创建可重用的会话 ---
+// --- 优化: 使用 AdvancedSession 来创建可重用的会话，并添加复用张量 ---
 type ONNXModel struct {
 	session      *onnxruntime_go.DynamicAdvancedSession
 	inputShape   onnxruntime_go.Shape
@@ -76,6 +76,9 @@ type ONNXModel struct {
 	channelsLast bool
 	inputNames   []string
 	outputNames  []string
+	// 用于张量复用
+	inputTensorData []float32
+	outputTensor    onnxruntime_go.Value
 }
 
 func NewONNXModel(modelPath string) (*ONNXModel, error) {
@@ -125,14 +128,26 @@ func NewONNXModel(modelPath string) (*ONNXModel, error) {
 	}
 
 	model := &ONNXModel{
-		session:     session,
-		inputShape:  append(onnxruntime_go.Shape{}, inputInfos[0].Dimensions...),
-		outputShape: append(onnxruntime_go.Shape{}, outputInfos[0].Dimensions...),
-		inputNames:  inputNames,
-		outputNames: outputNames,
+		session:         session,
+		inputShape:      append(onnxruntime_go.Shape{}, inputInfos[0].Dimensions...),
+		outputShape:     append(onnxruntime_go.Shape{}, outputInfos[0].Dimensions...),
+		inputNames:      inputNames,
+		outputNames:     outputNames,
+		inputTensorData: make([]float32, 0),
+		outputTensor:    nil,
 	}
 	model.detectLayout()
 	model.sanitizeOutputShape()
+	
+	// 初始化复用的张量数据
+	model.inputTensorData = make([]float32, model.inputHeight*model.inputWidth*model.channelCount)
+	outputTensor, err := onnxruntime_go.NewEmptyTensor[float32](model.outputShape)
+	if err != nil {
+		_ = session.Destroy()
+		_ = options.Destroy()
+		return nil, fmt.Errorf("failed to create output tensor: %w", err)
+	}
+	model.outputTensor = outputTensor
 
 	log.Printf("ONNX DynamicAdvancedSession created: input=%v output=%v channelsLast=%v",
 		model.inputShape, model.outputShape, model.channelsLast)
@@ -207,6 +222,9 @@ func (m *ONNXModel) sanitizeOutputShape() {
 
 func (m *ONNXModel) Destroy() {
 	m.session.Destroy()
+	if m.outputTensor != nil {
+		m.outputTensor.Destroy()
+	}
 }
 
 func (m *ONNXModel) processImageWithONNX(imageDataB64 string) (bool, error) {
@@ -231,7 +249,14 @@ func (m *ONNXModel) processImageWithONNX(imageDataB64 string) (bool, error) {
 	if m.channelCount <= 0 {
 		return false, fmt.Errorf("invalid channel count: %d", m.channelCount)
 	}
-	inputTensor := make([]float32, m.inputHeight*m.inputWidth*m.channelCount)
+	
+	// 重用预分配的输入张量数据
+	inputTensor := m.inputTensorData
+	// 清零张量数据（如果需要的话，根据具体实现可能不需要）
+	// for i := range inputTensor {
+	//     inputTensor[i] = 0
+	// }
+	
 	pixels := resizedImg.Pix
 	channelArea := m.inputHeight * m.inputWidth
 	for y := 0; y < m.inputHeight; y++ {
@@ -266,18 +291,17 @@ func (m *ONNXModel) processImageWithONNX(imageDataB64 string) (bool, error) {
 		}
 	}
 
-	// 创建输入和输出张量
+	// 创建输入张量（使用预分配的数据）
 	inputOrtValue, err := onnxruntime_go.NewTensor[float32](m.inputShape, inputTensor)
 	if err != nil {
 		return false, fmt.Errorf("failed to create input tensor: %w", err)
 	}
-	defer inputOrtValue.Destroy()
+	// 注意：这里不再需要 defer inputOrtValue.Destroy()，因为使用的是预分配数据
+	// 但为了安全起见，我们仍然创建和销毁张量（ONNX Runtime Go的限制）
 
-	outputOrtValue, err := onnxruntime_go.NewEmptyTensor[float32](m.outputShape)
-	if err != nil {
-		return false, fmt.Errorf("failed to create output tensor: %w", err)
-	}
-	defer outputOrtValue.Destroy()
+	// 使用预创建的输出张量
+	outputOrtValue := m.outputTensor
+	// 重置输出张量（如果支持的话）
 
 	// --- 修复 2: 调用 AdvancedSession 的 Run 方法，它接收输入和输出参数 ---
 	// 创建输入和输出的切片
@@ -285,11 +309,20 @@ func (m *ONNXModel) processImageWithONNX(imageDataB64 string) (bool, error) {
 	outputs := []onnxruntime_go.Value{outputOrtValue}
 	err = m.session.Run(inputs, outputs)
 	if err != nil {
+		// 销毁输入张量以避免内存泄漏
+		inputOrtValue.Destroy()
 		return false, fmt.Errorf("failed to run model inference: %w", err)
 	}
+	
+	// 销毁输入张量
+	inputOrtValue.Destroy()
 
 	// ... 解析结果逻辑保持不变 ...
-	outputData := outputOrtValue.GetData()
+	outputTensor, ok := outputOrtValue.(*onnxruntime_go.Tensor[float32])
+	if !ok {
+		return false, fmt.Errorf("failed to cast output value to tensor")
+	}
+	outputData := outputTensor.GetData()
 	threshold := float32(0.3)
 	isIllegal := outputData[1] > threshold || outputData[3] > threshold || outputData[4] > threshold
 	log.Printf("Inference output: [%.4f, %.4f, %.4f, %.4f, %.4f], IsIllegal: %v",
